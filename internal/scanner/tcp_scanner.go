@@ -1,17 +1,20 @@
 package scanner
 
 import (
-	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 // ScanResult 存储扫描结果
 type ScanResult struct {
-	Port    int
-	State   string
-	Service string
+	Port      int
+	State     string
+	Service   string
+	Banner    string
+	IPVersion string // 添加IP版本信息
 }
 
 // TCPScanner TCP扫描器
@@ -20,7 +23,7 @@ type TCPScanner struct {
 	MaxWorkers int
 }
 
-// 实现tcp扫描器的初始化
+// NewTCPScanner 创建新的TCP扫描器
 func NewTCPScanner(timeout time.Duration, maxWorkers int) *TCPScanner {
 	return &TCPScanner{
 		Timeout:    timeout,
@@ -28,42 +31,114 @@ func NewTCPScanner(timeout time.Duration, maxWorkers int) *TCPScanner {
 	}
 }
 
-// ScanPort 扫描单个端口，为后面并发地扫描多个端口提供函数
+// ScanPort 扫描单个端口
 func (s *TCPScanner) ScanPort(host string, port int) ScanResult {
-	address := fmt.Sprintf("%s:%d", host, port)
-	connect, err := net.DialTimeout("tcp", address, s.Timeout)
+	// 判断是否是IPv6地址
+	ipVersion := "IPv4"
+	if isIPv6(host) {
+		ipVersion = "IPv6"
+	}
 
-	// 初始化结果
+	// 使用net.JoinHostPort自动处理IPv6地址
+	address := net.JoinHostPort(host, strconv.Itoa(port))
+
+	conn, err := net.DialTimeout("tcp", address, s.Timeout)
+
 	result := ScanResult{
-		Port:    port,
-		State:   "closed",
-		Service: "unknown",
+		Port:      port,
+		State:     "closed",
+		Service:   "unknown",
+		IPVersion: ipVersion,
 	}
 
 	if err == nil {
-		connect.Close()
+		defer conn.Close()
 		result.State = "open"
-		// 这里可以添加服务识别逻辑
-		result.Service = s.guessService(port)
+
+		// 尝试获取banner
+		banner := s.getBanner(conn)
+		if banner != "" {
+			result.Banner = banner
+		}
+
+		// 根据端口和banner识别服务
+		result.Service = s.identifyService(port, banner)
 	}
 
 	return result
 }
 
-// guessService 设置判断服务的函数
-func (s *TCPScanner) guessService(port int) string {
-	// 常见的端口与服务映射
+// isIPv6 判断是否是IPv6地址
+func isIPv6(host string) bool {
+	// 去掉可能的方括号
+	host = strings.Trim(host, "[]")
+
+	// 尝试解析为IP
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.To4() == nil && ip.To16() != nil
+	}
+	return false
+}
+
+// getBanner 尝试获取服务banner
+func (s *TCPScanner) getBanner(conn net.Conn) string {
+	// 设置读取超时
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+	// 尝试读取banner
+	buffer := make([]byte, 1024)
+	n, err := conn.Read(buffer)
+	if err != nil {
+		return ""
+	}
+
+	return strings.TrimSpace(string(buffer[:n]))
+}
+
+// identifyService 识别服务
+func (s *TCPScanner) identifyService(port int, banner string) string {
+	// 优先根据banner识别
+	if banner != "" {
+		banner = strings.ToLower(banner)
+
+		switch {
+		case strings.Contains(banner, "ssh"):
+			return "ssh"
+		case strings.Contains(banner, "ftp"):
+			return "ftp"
+		case strings.Contains(banner, "smtp"):
+			return "smtp"
+		case strings.Contains(banner, "http"):
+			return "http"
+		case strings.Contains(banner, "mysql"):
+			return "mysql"
+		case strings.Contains(banner, "redis"):
+			return "redis"
+		}
+	}
+
+	// 如果没有banner，根据端口猜测
 	serviceMap := map[int]string{
-		21:   "ftp",
-		22:   "ssh",
-		23:   "telnet",
-		25:   "smtp",
-		53:   "dns",
-		80:   "http",
-		443:  "https",
-		3306: "mysql",
-		3389: "rdp",
-		8080: "http-proxy",
+		21:    "ftp",
+		22:    "ssh",
+		23:    "telnet",
+		25:    "smtp",
+		53:    "dns",
+		80:    "http",
+		110:   "pop3",
+		143:   "imap",
+		443:   "https",
+		465:   "smtps",
+		587:   "smtp",
+		993:   "imaps",
+		995:   "pop3s",
+		3306:  "mysql",
+		3389:  "rdp",
+		5432:  "postgresql",
+		6379:  "redis",
+		8080:  "http-proxy",
+		8443:  "https-alt",
+		27017: "mongodb",
 	}
 
 	if service, ok := serviceMap[port]; ok {
@@ -75,7 +150,7 @@ func (s *TCPScanner) guessService(port int) string {
 // ScanPorts 并发扫描多个端口
 func (s *TCPScanner) ScanPorts(host string, ports []int) []ScanResult {
 	var results []ScanResult
-	var mu sync.Mutex // 保护results的并发访问
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 
 	// 创建worker池
